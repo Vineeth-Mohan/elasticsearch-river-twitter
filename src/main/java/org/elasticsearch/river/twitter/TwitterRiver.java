@@ -43,8 +43,10 @@ import org.elasticsearch.threadpool.ThreadPool;
 import twitter4j.*;
 import twitter4j.conf.ConfigurationBuilder;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 
 /**
  *
@@ -64,6 +66,7 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
     private final String proxyPort;
     private final String proxyUser;
     private final String proxyPassword;
+    private TweetMapper tweetMapper;
 
     private final boolean raw;
     private final boolean ignoreRetweet;
@@ -94,7 +97,7 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
         super(riverName, riverSettings);
         this.client = client;
         this.threadPool = threadPool;
-
+        tweetMapper = new TweetMapper();
         String riverStreamType;
 
         if (riverSettings.settings().containsKey("twitter")) {
@@ -163,6 +166,7 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
             }
 
             if (filterSettings != null) {
+            	filterSettings = translateFilterSettings(filterSettings);
                 riverStreamType = "filter";
                 filterQuery = new FilterQuery();
                 filterQuery.count(XContentMapValues.nodeIntegerValue(filterSettings.get("count"), 0));
@@ -320,7 +324,36 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
         stream = buildTwitterStream();
     }
 
-    /**
+    private Map<String, Object> translateFilterSettings(Map<String, Object> filterSettings) {
+    	logger.info("BEFORE Filtered settings " + filterSettings);
+    	if(filterSettings == null){
+    		return filterSettings;
+    	}
+    	String tracks = "";
+    	String follows = "";
+    	Map<String,Object> rules = filterSettings;
+    	for(Entry<String, Object> rule : rules.entrySet()){
+    		String ruleName = rule.getKey();
+    		String trackList =  (String) ((Map<String,Object>) rule.getValue()).get("tracks");
+    		String followList = (String) ((Map<String,Object>) rule.getValue()).get("follow");
+    		if(tracks != null && !trackList.isEmpty()){
+    			tracks += "," + trackList;
+    		}
+    		if(followList != null && !followList.isEmpty()){
+    			follows += "," + followList;
+    		}
+    		tweetMapper.addTrackMapping(ruleName,trackList);
+    		tweetMapper.addFollowMapping(ruleName,followList);
+
+    	}
+    	((Map<String, Object>) filterSettings).clear();
+    	((Map<String, Object>) filterSettings).put("tracks", tracks);
+    	((Map<String, Object>) filterSettings).put("follow", follows);
+    	logger.info("AFTER Filtered settings " + filterSettings);
+		return filterSettings;
+	}
+
+	/**
      * Twitter Stream Builder
      * @return
      */
@@ -495,11 +528,17 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
         public void onStatus(Status status) {
             try {
                 // #24: We want to ignore retweets (default to false) https://github.com/elasticsearch/elasticsearch-river-twitter/issues/24
-                if (status.isRetweet() && ignoreRetweet) {
+            	List<Map<String, String>> contexts = null;
+            	if(!status.isRetweet() || !ignoreRetweet){
+            		contexts = tweetMapper.getContextInfo(status);
+            	}
+            	logger.info("Context is " + contexts);
+                if (contexts == null || contexts.size() == 0) {
                     if (logger.isTraceEnabled()) {
                         logger.trace("ignoring status cause retweet {} : {}", status.getUser().getName(), status.getText());
                     }
-                } else {
+                }
+                else {
                     if (logger.isTraceEnabled()) {
                         logger.trace("status {} : {}", status.getUser().getName(), status.getText());
                     }
@@ -516,6 +555,15 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
                         builder.field("truncated", status.isTruncated());
                         builder.field("language", status.getLang());
 
+                        builder.startArray("contexts");
+                        for(Map<String, String> context : contexts){
+                        	builder.startObject();
+                        	for(Entry<String, String> entry : context.entrySet()){
+                        		builder.field(entry.getKey(), entry.getValue());
+                        	}
+                        	builder.endObject();
+                        }
+                        builder.endArray();
                         if (status.getUserMentionEntities() != null) {
                             builder.startArray("mention");
                             for (UserMentionEntity user : status.getUserMentionEntities()) {
@@ -617,7 +665,6 @@ public class TwitterRiver extends AbstractRiverComponent implements River {
                             }
                             builder.endArray();
                         }
-
                         builder.startObject("user");
                         builder.field("id", status.getUser().getId());
                         builder.field("name", status.getUser().getName());
